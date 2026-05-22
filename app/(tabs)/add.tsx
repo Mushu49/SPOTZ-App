@@ -1,6 +1,6 @@
 // filepath: app/(tabs)/add.tsx
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   StyleSheet,
   View,
@@ -15,20 +15,36 @@ import {
   FlatList,
   Keyboard,
   TouchableWithoutFeedback,
-  Dimensions,
+  ActivityIndicator,
 } from 'react-native';
-import { useRouter } from 'expo-router';
+import { useNavigation, useRouter } from 'expo-router';
+import { Ionicons } from '@expo/vector-icons';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import MapView, { Marker, Region } from 'react-native-maps';
 import * as ImagePicker from 'expo-image-picker';
-import { useSpots } from '../context/SpotContext';
-import { useColorScheme } from '@/hooks/use-color-scheme';
-import { CATEGORIES, BEST_TIMES, PhotoCategory } from '../types';
+import { SPOTZ_BRAND, SPOTZ_THEME } from '../../src/constants/brand';
+import { CategoryIcon } from '../../src/components/CategoryIcon';
+import { SpotzSwitch } from '../../src/components/ui/SpotzSwitch';
+import { AddSpotProgress, useSpots } from '../../src/context/SpotContext';
+import { useAppColorScheme, useIsSpotzTheme } from '../../src/hooks/useAppColorScheme';
+import { CATEGORIES, BEST_TIMES, PhotoCategory, getSpotCategoryIds } from '../../src/types';
+import {
+  formatCoordinates,
+  formatLocationFromAddress,
+  ReverseGeocodeResult,
+} from '../../src/utils/location';
+import { getImageSource } from '../../src/utils/images';
 
 // Predefined popular locations for search
 // OpenStreetMap Nominatim API for global geocoding
 const NOMINATIM_SEARCH_URL = 'https://nominatim.openstreetmap.org/search';
 const NOMINATIM_REVERSE_URL = 'https://nominatim.openstreetmap.org/reverse';
-const MAX_IMAGES = 5;
+const MAX_IMAGES = 3;
+const TITLE_MAX_LENGTH = 35;
+const DESCRIPTION_MAX_LENGTH = 200;
+const GLASS_TAB_BAR_HEIGHT = 72;
+const GLASS_TAB_BAR_BOTTOM_OFFSET = 8;
+const ADD_BUTTON_TAB_GAP = 16;
 
 interface SearchResult {
   place_id: number;
@@ -37,12 +53,31 @@ interface SearchResult {
   lon: string;
   type: string;
   class: string;
+  address?: {
+    road?: string;
+    pedestrian?: string;
+    footway?: string;
+    cycleway?: string;
+    path?: string;
+    residential?: string;
+    city?: string;
+    town?: string;
+    village?: string;
+    municipality?: string;
+    county?: string;
+    state?: string;
+    region?: string;
+    country?: string;
+  };
 }
 
 export default function AddSpotScreen() {
   const router = useRouter();
-  const colorScheme = useColorScheme();
+  const navigation = useNavigation();
+  const colorScheme = useAppColorScheme();
+  const isSpotzTheme = useIsSpotzTheme();
   const isDark = colorScheme === 'dark';
+  const insets = useSafeAreaInsets();
   const { addSpot } = useSpots();
 
   const [title, setTitle] = useState('');
@@ -61,7 +96,6 @@ export default function AddSpotScreen() {
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [showResults, setShowResults] = useState(false);
   const [selectedPlaceName, setSelectedPlaceName] = useState('');
-  const [isSearching, setIsSearching] = useState(false);
   const [showFullscreenMap, setShowFullscreenMap] = useState(false);
   const [tempLocation, setTempLocation] = useState({ latitude: 37.7749, longitude: -122.4194 });
   const [tempRegion, setTempRegion] = useState<Region>({
@@ -74,6 +108,52 @@ export default function AddSpotScreen() {
   const [tempSearchResults, setTempSearchResults] = useState<SearchResult[]>([]);
   const [tempShowResults, setTempShowResults] = useState(false);
   const [tempSelectedPlaceName, setTempSelectedPlaceName] = useState('');
+  const [isUploading, setIsUploading] = useState(false);
+  const [uploadMessage, setUploadMessage] = useState('');
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [showSpotToOthers, setShowSpotToOthers] = useState(true);
+  const [allowComments, setAllowComments] = useState(true);
+
+  useEffect(() => {
+    navigation.setOptions({
+      tabBarStyle: showFullscreenMap ? { display: 'none' } : undefined,
+    });
+
+    return () => {
+      navigation.setOptions({
+        tabBarStyle: undefined,
+      });
+    };
+  }, [navigation, showFullscreenMap]);
+
+  const getReadableLocationName = async (latitude: number, longitude: number) => {
+    try {
+      const params = new URLSearchParams({
+        lat: `${latitude}`,
+        lon: `${longitude}`,
+        format: 'json',
+        addressdetails: '1',
+        'accept-language': 'en',
+      });
+
+      const response = await fetch(`${NOMINATIM_REVERSE_URL}?${params}`, {
+        headers: {
+          'User-Agent': 'SPOTZApp/1.0',
+        },
+      });
+
+      if (response.ok) {
+        const data: ReverseGeocodeResult = await response.json();
+        const formattedLocation = formatLocationFromAddress(data.address);
+
+        if (formattedLocation) return formattedLocation;
+      }
+    } catch (error) {
+      console.error('Reverse geocode error:', error);
+    }
+
+    return formatCoordinates(latitude, longitude);
+  };
 
   // Debounce search to avoid too many API calls
   useEffect(() => {
@@ -91,7 +171,6 @@ export default function AddSpotScreen() {
 
   // Search locations using OpenStreetMap Nominatim API
   const searchLocations = async (query: string) => {
-    setIsSearching(true);
     try {
       const params = new URLSearchParams({
         q: query,
@@ -115,13 +194,11 @@ export default function AddSpotScreen() {
     } catch (error) {
       console.error('Search error:', error);
       setSearchResults([]);
-    } finally {
-      setIsSearching(false);
     }
   };
 
   // Handle selecting a location from search results
-  const handleSelectLocation = (result: SearchResult) => {
+  const handleSelectLocation = async (result: SearchResult) => {
     const lat = parseFloat(result.lat);
     const lon = parseFloat(result.lon);
     
@@ -133,9 +210,10 @@ export default function AddSpotScreen() {
       longitudeDelta: 0.05,
     });
     
-    // Extract a short name from display_name
-    const nameParts = result.display_name.split(',');
-    const shortName = nameParts[0].trim();
+    const shortName =
+      formatLocationFromAddress(result.address) ||
+      await getReadableLocationName(lat, lon) ||
+      result.display_name.split(',').slice(0, 2).join(',').trim();
     setSelectedPlaceName(shortName);
     setSearchQuery(shortName);
     setShowResults(false);
@@ -169,7 +247,7 @@ export default function AddSpotScreen() {
   };
 
   // Handle selecting a location in fullscreen map
-  const handleTempSelectLocation = (result: SearchResult) => {
+  const handleTempSelectLocation = async (result: SearchResult) => {
     Keyboard.dismiss();
     
     const lat = parseFloat(result.lat);
@@ -183,20 +261,26 @@ export default function AddSpotScreen() {
       longitudeDelta: 0.05,
     });
     
-    const nameParts = result.display_name.split(',');
-    const shortName = nameParts[0].trim();
+    const shortName =
+      formatLocationFromAddress(result.address) ||
+      await getReadableLocationName(lat, lon) ||
+      result.display_name.split(',').slice(0, 2).join(',').trim();
     setTempSelectedPlaceName(shortName);
     setTempSearchQuery(shortName);
     setTempShowResults(false);
   };
 
   // Handle map press in fullscreen mode
-  const handleTempMapPress = (event: any) => {
+  const handleTempMapPress = async (event: any) => {
     Keyboard.dismiss();
     
     const { coordinate } = event.nativeEvent;
     setTempLocation(coordinate);
-    setTempSelectedPlaceName('');
+    const readableLocation = await getReadableLocationName(
+      coordinate.latitude,
+      coordinate.longitude
+    );
+    setTempSelectedPlaceName(readableLocation);
   };
 
   // Confirm location from fullscreen map
@@ -206,13 +290,33 @@ export default function AddSpotScreen() {
     setLocation(tempLocation);
     setRegion(tempRegion);
     setSelectedPlaceName(tempSelectedPlaceName);
-    setSearchQuery(tempSelectedPlaceName || `${tempLocation.latitude.toFixed(4)}, ${tempLocation.longitude.toFixed(4)}`);
+    setSearchQuery(tempSelectedPlaceName || formatCoordinates(tempLocation.latitude, tempLocation.longitude));
     setShowFullscreenMap(false);
   };
 
-  const isFormValid = title && selectedCategory && selectedTime;
+  const isTitleNearLimit = title.length >= TITLE_MAX_LENGTH - 10;
+  const isDescriptionNearLimit = description.length >= DESCRIPTION_MAX_LENGTH - 25;
+  const hasSelectedImage = images.length > 0;
+  const isFormValid = title.trim().length > 0 && !!selectedCategory && !!selectedTime && hasSelectedImage;
+  const canSubmit = isFormValid && !isUploading;
+  const scrollContentBottomPadding =
+    insets.bottom +
+    GLASS_TAB_BAR_HEIGHT +
+    GLASS_TAB_BAR_BOTTOM_OFFSET +
+    ADD_BUTTON_TAB_GAP +
+    (Platform.OS === 'android' ? 16 : 0);
 
-  const handleSubmit = () => {
+  const handleTitleChange = (text: string) => {
+    setTitle(text.slice(0, TITLE_MAX_LENGTH));
+  };
+
+  const handleDescriptionChange = (text: string) => {
+    setDescription(text.slice(0, DESCRIPTION_MAX_LENGTH));
+  };
+
+  const handleSubmit = async () => {
+    if (isUploading) return;
+
     if (!title.trim()) {
       Alert.alert('Error', 'Please enter a title for your spot');
       return;
@@ -225,37 +329,81 @@ export default function AddSpotScreen() {
       Alert.alert('Error', 'Please select the best time to shoot');
       return;
     }
+    if (!hasSelectedImage) {
+      Alert.alert('Error', 'Please add at least one photo.');
+      return;
+    }
 
-    addSpot({
-      title: title.trim(),
-      description: description.trim(),
-      category: selectedCategory,
-      bestTimeToShoot: selectedTime,
-      images: images.length > 0 ? images : ['https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=800'],
-      latitude: location.latitude,
-      longitude: location.longitude,
-      isFavorite: false,
-    });
+    const trimmedTitle = title.trim();
+    const trimmedDescription = description.trim();
+    const locationName = selectedPlaceName || formatCoordinates(location.latitude, location.longitude);
 
-    Alert.alert('Success', 'Your spot has been added!', [
-      {
-        text: 'OK',
-        onPress: () => {
-          // Reset form
-          setTitle('');
-          setDescription('');
-          setSelectedCategory(null);
-          setSelectedTime('');
-          setImages([]);
-          router.push('/');
+    try {
+      setIsUploading(true);
+      setUploadMessage('Preparing images...');
+      setUploadProgress(0);
+
+      await addSpot({
+        title: trimmedTitle,
+        description: trimmedDescription,
+        category: selectedCategory,
+        categoryId: selectedCategory,
+        categoryIds: getSpotCategoryIds(selectedCategory),
+        bestTimeToShoot: selectedTime,
+        images,
+        latitude: location.latitude,
+        longitude: location.longitude,
+        locationName,
+        visibility: showSpotToOthers ? 'public' : 'private',
+        allowComments,
+        isFavorite: false,
+      }, {
+        onProgress: (progress: AddSpotProgress) => {
+          setUploadMessage(progress.message);
+          if (typeof progress.progress === 'number') {
+            setUploadProgress(progress.progress);
+          }
         },
-      },
-    ]);
+      });
+
+      setUploadMessage('Almost done...');
+      setUploadProgress(1);
+      Alert.alert('Success', 'Your spot has been added!', [
+        {
+          text: 'OK',
+          onPress: () => {
+            // Reset form
+            setTitle('');
+            setDescription('');
+            setSelectedCategory(null);
+            setSelectedTime('');
+            setImages([]);
+            setShowSpotToOthers(true);
+            setAllowComments(true);
+            router.push('/');
+          },
+        },
+      ]);
+    } catch (error) {
+      console.error('[AddSpot] Save error', error);
+      Alert.alert(
+        'Upload Failed',
+        error instanceof Error ? error.message : 'Unable to save this spot right now. Please try again.'
+      );
+    } finally {
+      setIsUploading(false);
+    }
   };
 
-  const handleMapPress = (event: any) => {
+  const handleMapPress = async (event: any) => {
     const { coordinate } = event.nativeEvent;
     setLocation(coordinate);
+    const readableLocation = await getReadableLocationName(
+      coordinate.latitude,
+      coordinate.longitude
+    );
+    setSelectedPlaceName(readableLocation);
+    setSearchQuery(readableLocation);
   };
 
   const pickImage = async () => {
@@ -263,7 +411,7 @@ export default function AddSpotScreen() {
     const remainingSlots = MAX_IMAGES - images.length;
     
     if (remainingSlots <= 0) {
-      Alert.alert('Limit Reached', 'You can upload maximum 5 images per spot.');
+      Alert.alert('Limit Reached', `You can upload maximum ${MAX_IMAGES} images per spot.`);
       return;
     }
     
@@ -283,7 +431,14 @@ export default function AddSpotScreen() {
     });
 
     if (!result.canceled && result.assets.length > 0) {
-      const newImages = result.assets.map((asset) => asset.uri);
+      if (result.assets.length > remainingSlots) {
+        Alert.alert(
+          'Image Limit',
+          `Only ${remainingSlots} more ${remainingSlots === 1 ? 'image can' : 'images can'} be added.`
+        );
+      }
+
+      const newImages = result.assets.slice(0, remainingSlots).map((asset) => asset.uri);
       setImages((prev) => [...prev, ...newImages].slice(0, MAX_IMAGES));
     }
   };
@@ -294,15 +449,19 @@ export default function AddSpotScreen() {
 
   return (
     <KeyboardAvoidingView
-      style={[styles.container, isDark && styles.containerDark]}
+      style={[styles.container, isDark && styles.containerDark, isSpotzTheme && styles.containerSpotz]}
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
     >
-      <ScrollView style={styles.scrollView} showsVerticalScrollIndicator={false}>
+      <ScrollView
+        style={styles.scrollView}
+        contentContainerStyle={{ paddingBottom: scrollContentBottomPadding }}
+        showsVerticalScrollIndicator={false}
+      >
         {/* Header */}
         <View style={styles.header}>
           <Text style={[styles.headerTitle, isDark && styles.textLight]}>Add New Spot</Text>
           <Text style={[styles.headerSubtitle, isDark && styles.textMuted]}>
-            Share your favorite photo location
+            Add your favorite photo location
           </Text>
         </View>
 
@@ -310,30 +469,50 @@ export default function AddSpotScreen() {
         <View style={styles.inputGroup}>
           <Text style={[styles.label, isDark && styles.textLight]}>Title *</Text>
           <TextInput
-            style={[styles.input, isDark && styles.inputDark]}
+            style={[styles.input, isDark && styles.inputDark, isSpotzTheme && styles.inputSpotz]}
             placeholder="Enter spot name"
             placeholderTextColor={isDark ? '#666' : '#999'}
             value={title}
-            onChangeText={setTitle}
+            onChangeText={handleTitleChange}
+            maxLength={TITLE_MAX_LENGTH}
           />
+          <Text
+            style={[
+              styles.characterCounter,
+              isDark && styles.characterCounterDark,
+              isTitleNearLimit && (isDark ? styles.characterCounterWarningDark : styles.characterCounterWarning),
+            ]}
+          >
+            {title.length}/{TITLE_MAX_LENGTH}
+          </Text>
         </View>
 
         {/* Description Input */}
         <View style={styles.inputGroup}>
           <Text style={[styles.label, isDark && styles.textLight]}>Description</Text>
           <TextInput
-            style={[styles.input, styles.textArea, isDark && styles.inputDark]}
+            style={[styles.input, styles.textArea, isDark && styles.inputDark, isSpotzTheme && styles.inputSpotz]}
             placeholder="Describe this photo spot..."
             placeholderTextColor={isDark ? '#666' : '#999'}
             value={description}
-            onChangeText={setDescription}
+            onChangeText={handleDescriptionChange}
+            maxLength={DESCRIPTION_MAX_LENGTH}
             multiline
             numberOfLines={4}
           />
+          <Text
+            style={[
+              styles.characterCounter,
+              isDark && styles.characterCounterDark,
+              isDescriptionNearLimit && (isDark ? styles.characterCounterWarningDark : styles.characterCounterWarning),
+            ]}
+          >
+            {description.length}/{DESCRIPTION_MAX_LENGTH}
+          </Text>
         </View>
 
         {/* Images Section */}
-        <View style={[styles.card, isDark && styles.cardDark]}>
+        <View style={[styles.card, isDark && styles.cardDark, isSpotzTheme && styles.cardSpotz]}>
           <Text style={[styles.cardTitle, isDark && styles.textLight]}>Images</Text>
           <Text style={[styles.cardSubtitle, isDark && styles.textMuted]}>
             You can select up to {MAX_IMAGES} images ({images.length}/{MAX_IMAGES} selected)
@@ -366,13 +545,26 @@ export default function AddSpotScreen() {
                 renderItem={({ item, index }) => (
                   <View style={styles.imagePreviewWrapper}>
                     <Image 
-                      source={{ uri: item }} 
+                      source={getImageSource(item)} 
                       style={styles.imagePreview} 
                     />
                     <TouchableOpacity
-                      style={styles.removeImageButton}
+                      style={[
+                        styles.removeImageButton,
+                        isDark ? styles.removeImageButtonDark : styles.removeImageButtonLight,
+                        Platform.OS === 'android' && (
+                          isDark ? styles.removeImageButtonAndroidDark : styles.removeImageButtonAndroidLight
+                        ),
+                      ]}
                       onPress={() => removeImage(index)}
+                      activeOpacity={0.82}
                     >
+                      <Ionicons
+                        name="close"
+                        size={Platform.OS === 'android' ? 20 : 18}
+                        color={isDark ? '#ffffff' : '#111827'}
+                        style={styles.removeImageIcon}
+                      />
                       <Text style={styles.removeImageText}>×</Text>
                     </TouchableOpacity>
                   </View>
@@ -383,7 +575,7 @@ export default function AddSpotScreen() {
         </View>
 
         {/* Category Section */}
-        <View style={[styles.card, isDark && styles.cardDark]}>
+        <View style={[styles.card, isDark && styles.cardDark, isSpotzTheme && styles.cardSpotz]}>
           <Text style={[styles.cardTitle, isDark && styles.textLight]}>Category *</Text>
           <Text style={[styles.cardSubtitle, isDark && styles.textMuted]}>
             Choose the main category of your spot
@@ -395,15 +587,16 @@ export default function AddSpotScreen() {
                 style={[
                   styles.categoryButton,
                   isDark && styles.categoryButtonDark,
+                  isSpotzTheme && styles.categoryButtonSpotz,
                   selectedCategory === cat.value && (isDark ? styles.categoryButtonSelectedDark : styles.categoryButtonSelected),
                 ]}
                 onPress={() => setSelectedCategory(cat.value)}
               >
-                <Text style={styles.categoryIcon}>{cat.icon}</Text>
+                <CategoryIcon category={cat.value} size={26} style={styles.categoryIcon} />
                 <Text
                   style={[
                     styles.categoryLabel,
-                    selectedCategory === cat.value && styles.categoryLabelSelected,
+                    selectedCategory === cat.value && (isSpotzTheme ? styles.selectedLabelSpotz : styles.categoryLabelSelected),
                     isDark && selectedCategory !== cat.value && styles.textLight,
                   ]}
                 >
@@ -415,7 +608,7 @@ export default function AddSpotScreen() {
         </View>
 
         {/* Best Time to Shoot Section */}
-        <View style={[styles.card, isDark && styles.cardDark]}>
+        <View style={[styles.card, isDark && styles.cardDark, isSpotzTheme && styles.cardSpotz]}>
           <Text style={[styles.cardTitle, isDark && styles.textLight]}>Best Time to Shoot *</Text>
           <Text style={[styles.cardSubtitle, isDark && styles.textMuted]}>
             Select the best time for great shots at this location
@@ -427,12 +620,13 @@ export default function AddSpotScreen() {
                 style={[
                   styles.timeButton,
                   isDark && styles.timeButtonDark,
+                  isSpotzTheme && styles.timeButtonSpotz,
                   selectedTime === time && (isDark ? styles.timeButtonSelectedDark : styles.timeButtonSelected),
                 ]}
                 onPress={() => setSelectedTime(time)}
               >
                 <Text
-                  style={[styles.timeLabel, selectedTime === time && styles.timeLabelSelected, isDark && selectedTime !== time && styles.textLight]}
+                  style={[styles.timeLabel, selectedTime === time && (isSpotzTheme ? styles.selectedLabelSpotz : styles.timeLabelSelected), isDark && selectedTime !== time && styles.textLight]}
                 >
                   {time}
                 </Text>
@@ -442,17 +636,17 @@ export default function AddSpotScreen() {
         </View>
 
         {/* Location Section */}
-        <View style={[styles.card, isDark && styles.cardDark]}>
+        <View style={[styles.card, isDark && styles.cardDark, isSpotzTheme && styles.cardSpotz]}>
           <Text style={[styles.cardTitle, isDark && styles.textLight]}>Location *</Text>
           <Text style={[styles.cardSubtitle, isDark && styles.textMuted]}>
             Set the exact location of your spot on the map
           </Text>
           
           {/* Search Bar */}
-          <View style={[styles.searchContainer, isDark && styles.searchContainerDark]}>
+          <View style={[styles.searchContainer, isDark && styles.searchContainerDark, isSpotzTheme && styles.searchContainerSpotz]}>
             <Text style={styles.searchIcon}>🔍</Text>
             <TextInput
-              style={[styles.searchInput, isDark && styles.searchInputDark]}
+              style={[styles.searchInput, isDark && styles.searchInputDark, isSpotzTheme && styles.searchInputSpotz]}
               placeholder="Search city, street, or landmark..."
               placeholderTextColor={isDark ? '#666' : '#999'}
               value={searchQuery}
@@ -469,30 +663,19 @@ export default function AddSpotScreen() {
           {/* Search Results Dropdown */}
           {showResults && searchResults.length > 0 && (
             <View style={[styles.searchResults, isDark && styles.searchResultsDark]}>
-              <FlatList
-                data={searchResults}
-                keyExtractor={(item) => `${item.place_id}`}
-                renderItem={({ item }) => (
-                  <TouchableOpacity
-                    style={[styles.searchResultItem, isDark && styles.searchResultItemDark]}
-                    onPress={() => handleSelectLocation(item)}
-                  >
-                    <Text style={[styles.searchResultText, isDark && styles.textLight]} numberOfLines={2}>
-                      {item.display_name}
-                    </Text>
-                  </TouchableOpacity>
-                )}
-                keyboardShouldPersistTaps="handled"
-              />
+              {searchResults.map((item) => (
+                <TouchableOpacity
+                  key={`${item.place_id}`}
+                  style={[styles.searchResultItem, isDark && styles.searchResultItemDark]}
+                  onPress={() => handleSelectLocation(item)}
+                >
+                  <Text style={[styles.searchResultText, isDark && styles.textLight]} numberOfLines={2}>
+                    {item.display_name}
+                  </Text>
+                </TouchableOpacity>
+              ))}
             </View>
           )}
-
-          {/* Selected Place Name */}
-          {selectedPlaceName ? (
-            <Text style={[styles.selectedPlaceText, isDark && styles.textLight]}>
-              📍 {selectedPlaceName}
-            </Text>
-          ) : null}
 
           {/* Map */}
           <View style={[styles.mapContainer, isDark && styles.mapContainerDark]}>
@@ -501,34 +684,107 @@ export default function AddSpotScreen() {
               region={region}
               onRegionChangeComplete={setRegion}
               onPress={handleMapPress}
-              customMapStyle={isDark ? darkMapStyle : []}
+              customMapStyle={isDark && Platform.OS === 'ios' ? darkMapStyle : []}
             >
               <Marker coordinate={location} />
             </MapView>
             {/* Expand Button */}
             <TouchableOpacity
-              style={[styles.expandButton, isDark && styles.expandButtonDark]}
+              style={[
+                styles.expandButton,
+                isDark && styles.expandButtonDark,
+                isSpotzTheme && styles.expandButtonSpotz,
+                Platform.OS === 'android' && styles.expandButtonAndroid,
+              ]}
               onPress={() => setShowFullscreenMap(true)}
-              activeOpacity={0.7}
+              activeOpacity={0.78}
+              accessibilityRole="button"
+              accessibilityLabel="Open fullscreen map"
             >
+              <Ionicons
+                name="expand-outline"
+                size={21}
+                color={isSpotzTheme ? SPOTZ_THEME.text : '#ffffff'}
+              />
               <Text style={styles.expandButtonText}>⛶</Text>
             </TouchableOpacity>
           </View>
           <Text style={[styles.coordinates, isDark && styles.textMuted]}>
-            {location.latitude.toFixed(4)}, {location.longitude.toFixed(4)}
+            {selectedPlaceName || formatCoordinates(location.latitude, location.longitude)}
+          </Text>
+        </View>
+
+        {/* Visibility Section */}
+        <View style={[styles.card, styles.settingsCard, isDark && styles.cardDark, isSpotzTheme && styles.cardSpotz]}>
+          <View style={styles.settingsTitleRow}>
+            <Text style={[styles.cardTitle, styles.commentsPermissionTitle, isDark && styles.textLight]}>
+              Show this spot to others
+            </Text>
+            <View style={styles.settingsSwitchSlot}>
+              <SpotzSwitch
+                value={showSpotToOthers}
+                onValueChange={setShowSpotToOthers}
+              />
+            </View>
+          </View>
+          <Text style={[styles.commentsPermissionHelper, isDark && styles.textMuted]}>
+            If off, only you can see this spot.
+          </Text>
+        </View>
+
+        {/* Comments Section */}
+        <View style={[styles.card, styles.settingsCard, isDark && styles.cardDark, isSpotzTheme && styles.cardSpotz]}>
+          <View style={styles.settingsTitleRow}>
+            <Text style={[styles.cardTitle, styles.commentsPermissionTitle, isDark && styles.textLight]}>
+              Allow comments
+            </Text>
+            <View style={styles.settingsSwitchSlot}>
+              <SpotzSwitch
+                value={allowComments}
+                onValueChange={setAllowComments}
+              />
+            </View>
+          </View>
+          <Text style={[styles.commentsPermissionHelper, isDark && styles.textMuted]}>
+            {allowComments
+              ? 'Comments help your SPOTZ gain more visibility and popularity.'
+              : 'With comments disabled, your SPOTZ may grow slower in Popular rankings.'}
           </Text>
         </View>
 
         {/* Submit Button */}
         <TouchableOpacity
-          style={[styles.submitButton, !isFormValid && styles.submitButtonDisabled]}
+          style={[
+            styles.submitButton,
+            !isFormValid && styles.submitButtonDisabled,
+            isUploading && styles.submitButtonUploading,
+          ]}
           onPress={handleSubmit}
-          disabled={!isFormValid}
+          disabled={!canSubmit}
+          activeOpacity={0.82}
         >
-          <Text style={styles.submitButtonText}>Add Spot</Text>
+          {isUploading ? (
+            <View style={styles.submitButtonContent}>
+              <ActivityIndicator size="small" color="#ffffff" />
+              <Text style={[styles.submitButtonText, isSpotzTheme && styles.submitButtonTextSpotz]}>
+                {uploadMessage || 'Uploading...'}
+              </Text>
+            </View>
+          ) : (
+            <Text style={[styles.submitButtonText, isSpotzTheme && styles.submitButtonTextSpotz]}>Add Spot</Text>
+          )}
         </TouchableOpacity>
+        {isUploading && (
+          <View style={styles.uploadProgressContainer}>
+            <View style={styles.uploadProgressTrack}>
+              <View style={[styles.uploadProgressFill, { width: `${Math.round(uploadProgress * 100)}%` }]} />
+            </View>
+            <Text style={[styles.uploadProgressText, isDark && styles.textMuted]}>
+              {uploadMessage || 'Uploading...'}
+            </Text>
+          </View>
+        )}
 
-        <View style={styles.bottomPadding} />
       </ScrollView>
 
       {/* Fullscreen Map Modal */}
@@ -541,7 +797,7 @@ export default function AddSpotScreen() {
               region={tempRegion}
               onRegionChangeComplete={setTempRegion}
               onPress={handleTempMapPress}
-              customMapStyle={isDark ? darkMapStyle : []}
+              customMapStyle={isDark && Platform.OS === 'ios' ? darkMapStyle : []}
             >
               <Marker coordinate={tempLocation} />
             </MapView>
@@ -549,12 +805,19 @@ export default function AddSpotScreen() {
           {/* Floating Top Bar Container */}
           <View style={styles.floatingTopBar}>
             {/* Floating Search Bar */}
-            <View style={[styles.floatingSearchContainer, isDark && styles.floatingSearchContainerDark]}>
+            <View
+              style={[
+                styles.floatingSearchContainer,
+                isDark && styles.floatingSearchContainerDark,
+                Platform.OS === 'android' && styles.floatingSearchContainerAndroid,
+              ]}
+            >
               <Text style={styles.searchIcon}>🔍</Text>
               <TextInput
                 style={[styles.searchInput, isDark && styles.searchInputDark]}
                 placeholder="Search city, street, or landmark..."
                 placeholderTextColor={isDark ? '#666' : '#999'}
+                underlineColorAndroid="transparent"
                 value={tempSearchQuery}
                 onChangeText={(text) => {
                   setTempSearchQuery(text);
@@ -576,11 +839,21 @@ export default function AddSpotScreen() {
 
             {/* Floating Close Button */}
             <TouchableOpacity
-              style={[styles.floatingCloseButton, isDark && styles.floatingCloseButtonDark]}
+              style={[
+                styles.floatingCloseButton,
+                isDark && styles.floatingCloseButtonDark,
+                Platform.OS === 'android' && styles.floatingCloseButtonAndroid,
+                isSpotzTheme && styles.floatingCloseButtonSpotz,
+              ]}
               onPress={() => setShowFullscreenMap(false)}
               activeOpacity={0.7}
+              hitSlop={8}
             >
-              <Text style={styles.floatingCloseButtonText}>✕</Text>
+              <Ionicons
+                name="close"
+                size={22}
+                color={isSpotzTheme ? SPOTZ_THEME.text : '#ffffff'}
+              />
             </TouchableOpacity>
           </View>
 
@@ -644,7 +917,10 @@ const styles = StyleSheet.create({
     backgroundColor: '#ffffff',
   },
   containerDark: {
-    backgroundColor: '#1a1a1a',
+    backgroundColor: SPOTZ_BRAND.charcoal,
+  },
+  containerSpotz: {
+    backgroundColor: SPOTZ_THEME.background,
   },
   scrollView: {
     flex: 1,
@@ -677,8 +953,17 @@ const styles = StyleSheet.create({
     padding: 20,
     marginBottom: 24,
   },
+  settingsCard: {
+    paddingHorizontal: 18,
+    paddingVertical: 14,
+  },
   cardDark: {
     backgroundColor: '#2a2a2a',
+  },
+  cardSpotz: {
+    backgroundColor: SPOTZ_THEME.panel,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: SPOTZ_THEME.border,
   },
   cardTitle: {
     fontSize: 20,
@@ -690,6 +975,32 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#666666',
     marginBottom: 16,
+  },
+  settingsTitleRow: {
+    minHeight: 36,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 16,
+  },
+  commentsPermissionTitle: {
+    flex: 1,
+    marginBottom: 0,
+    lineHeight: 24,
+    includeFontPadding: false,
+  },
+  settingsSwitchSlot: {
+    minWidth: 52,
+    minHeight: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  commentsPermissionHelper: {
+    color: '#666666',
+    fontSize: 12,
+    lineHeight: 17,
+    fontWeight: '500',
+    marginTop: 5,
   },
   inputGroup: {
     marginBottom: 24,
@@ -716,9 +1027,32 @@ const styles = StyleSheet.create({
     backgroundColor: '#2a2a2a',
     color: '#ffffff',
   },
+  inputSpotz: {
+    backgroundColor: SPOTZ_THEME.input,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: SPOTZ_THEME.border,
+  },
   textArea: {
     height: 100,
     textAlignVertical: 'top',
+  },
+  characterCounter: {
+    alignSelf: 'flex-end',
+    marginTop: 6,
+    fontSize: 12,
+    color: '#666666',
+    opacity: 0.75,
+  },
+  characterCounterDark: {
+    color: '#888888',
+  },
+  characterCounterWarning: {
+    color: '#d97706',
+    opacity: 0.9,
+  },
+  characterCounterWarningDark: {
+    color: '#f59e0b',
+    opacity: 0.9,
   },
   categoryGrid: {
     flexDirection: 'row',
@@ -743,26 +1077,29 @@ const styles = StyleSheet.create({
     backgroundColor: '#2a2a2a',
     borderColor: '#3a3a3a',
   },
+  categoryButtonSpotz: {
+    backgroundColor: SPOTZ_THEME.input,
+    borderColor: SPOTZ_THEME.border,
+  },
   categoryButtonSelected: {
-    backgroundColor: '#007AFF',
-    borderColor: '#007AFF',
-    shadowColor: '#007AFF',
+    backgroundColor: SPOTZ_BRAND.accent,
+    borderColor: SPOTZ_BRAND.accent,
+    shadowColor: SPOTZ_BRAND.accent,
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.3,
     shadowRadius: 4,
     elevation: 4,
   },
   categoryButtonSelectedDark: {
-    backgroundColor: '#007AFF',
-    borderColor: '#007AFF',
-    shadowColor: '#007AFF',
+    backgroundColor: SPOTZ_BRAND.accent,
+    borderColor: SPOTZ_BRAND.accent,
+    shadowColor: SPOTZ_BRAND.accent,
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.4,
     shadowRadius: 6,
     elevation: 6,
   },
   categoryIcon: {
-    fontSize: 26,
     marginBottom: 8,
   },
   categoryLabel: {
@@ -773,6 +1110,9 @@ const styles = StyleSheet.create({
   },
   categoryLabelSelected: {
     color: '#ffffff',
+  },
+  selectedLabelSpotz: {
+    color: SPOTZ_THEME.accentText,
   },
   timeGrid: {
     flexDirection: 'row',
@@ -797,19 +1137,23 @@ const styles = StyleSheet.create({
     backgroundColor: '#2a2a2a',
     borderColor: '#3a3a3a',
   },
+  timeButtonSpotz: {
+    backgroundColor: SPOTZ_THEME.input,
+    borderColor: SPOTZ_THEME.border,
+  },
   timeButtonSelected: {
-    backgroundColor: '#007AFF',
-    borderColor: '#007AFF',
-    shadowColor: '#007AFF',
+    backgroundColor: SPOTZ_BRAND.accent,
+    borderColor: SPOTZ_BRAND.accent,
+    shadowColor: SPOTZ_BRAND.accent,
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.3,
     shadowRadius: 4,
     elevation: 4,
   },
   timeButtonSelectedDark: {
-    backgroundColor: '#007AFF',
-    borderColor: '#007AFF',
-    shadowColor: '#007AFF',
+    backgroundColor: SPOTZ_BRAND.accent,
+    borderColor: SPOTZ_BRAND.accent,
+    shadowColor: SPOTZ_BRAND.accent,
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.4,
     shadowRadius: 6,
@@ -850,22 +1194,32 @@ const styles = StyleSheet.create({
     width: 40,
     height: 40,
     borderRadius: 20,
-    backgroundColor: 'rgba(255, 255, 255, 0.2)',
+    backgroundColor: 'rgba(17, 24, 39, 0.62)',
     justifyContent: 'center',
     alignItems: 'center',
     borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.3)',
+    borderColor: 'rgba(255, 255, 255, 0.42)',
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.3,
     shadowRadius: 4,
     elevation: 5,
+    overflow: 'hidden',
   },
   expandButtonDark: {
     backgroundColor: 'rgba(0, 0, 0, 0.3)',
     borderColor: 'rgba(255, 255, 255, 0.2)',
   },
+  expandButtonSpotz: {
+    backgroundColor: 'rgba(26, 36, 25, 0.88)',
+    borderColor: SPOTZ_THEME.borderStrong,
+  },
+  expandButtonAndroid: {
+    elevation: 0,
+    shadowOpacity: 0,
+  },
   expandButtonText: {
+    display: 'none',
     fontSize: 22,
     color: '#ffffff',
   },
@@ -880,7 +1234,7 @@ const styles = StyleSheet.create({
     zIndex: 1000,
   },
   fullscreenMapContainerDark: {
-    backgroundColor: '#1a1a1a',
+    backgroundColor: SPOTZ_BRAND.charcoal,
   },
   fullscreenMap: {
     ...StyleSheet.absoluteFillObject,
@@ -900,12 +1254,15 @@ const styles = StyleSheet.create({
   floatingCloseButton: {
     width: 40,
     height: 40,
+    flexShrink: 0,
     borderRadius: 20,
     backgroundColor: 'rgba(255, 255, 255, 0.2)',
     justifyContent: 'center',
     alignItems: 'center',
+    padding: 0,
     borderWidth: 1,
     borderColor: 'rgba(255, 255, 255, 0.3)',
+    overflow: 'hidden',
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.3,
@@ -916,13 +1273,20 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0, 0, 0, 0.3)',
     borderColor: 'rgba(255, 255, 255, 0.2)',
   },
-  floatingCloseButtonText: {
-    fontSize: 18,
-    color: '#ffffff',
+  floatingCloseButtonSpotz: {
+    backgroundColor: 'rgba(26, 36, 25, 0.88)',
+    borderColor: SPOTZ_THEME.borderStrong,
+  },
+  floatingCloseButtonAndroid: {
+    backgroundColor: 'rgba(18, 18, 20, 0.82)',
+    borderColor: 'rgba(255, 255, 255, 0.18)',
+    shadowOpacity: 0,
+    elevation: 0,
   },
   // Floating Search Container
   floatingSearchContainer: {
     flex: 1,
+    marginRight: 12,
     flexDirection: 'row',
     alignItems: 'center',
     backgroundColor: 'rgba(255, 255, 255, 0.2)',
@@ -940,6 +1304,12 @@ const styles = StyleSheet.create({
   floatingSearchContainerDark: {
     backgroundColor: 'rgba(0, 0, 0, 0.3)',
     borderColor: 'rgba(255, 255, 255, 0.2)',
+  },
+  floatingSearchContainerAndroid: {
+    backgroundColor: 'rgba(18, 18, 20, 0.82)',
+    borderColor: 'rgba(255, 255, 255, 0.18)',
+    shadowOpacity: 0,
+    elevation: 0,
   },
   // Floating Search Results
   floatingSearchResults: {
@@ -988,7 +1358,7 @@ const styles = StyleSheet.create({
     bottom: 40,
     left: 20,
     right: 20,
-    backgroundColor: '#007AFF',
+    backgroundColor: SPOTZ_BRAND.accent,
     paddingVertical: 16,
     borderRadius: 14,
     alignItems: 'center',
@@ -1019,15 +1389,23 @@ const styles = StyleSheet.create({
     backgroundColor: '#2a2a2a',
     borderColor: '#3a3a3a',
   },
+  searchContainerSpotz: {
+    backgroundColor: SPOTZ_THEME.input,
+    borderColor: SPOTZ_THEME.border,
+  },
   searchIcon: {
     fontSize: 18,
     marginRight: 10,
   },
   searchInput: {
     flex: 1,
+    backgroundColor: 'transparent',
     paddingVertical: 10,
     fontSize: 15,
     color: '#000000',
+  },
+  searchInputSpotz: {
+    color: SPOTZ_THEME.text,
   },
   searchInputDark: {
     color: '#ffffff',
@@ -1071,7 +1449,7 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
   submitButton: {
-    backgroundColor: '#007AFF',
+    backgroundColor: SPOTZ_BRAND.accent,
     paddingVertical: 16,
     borderRadius: 12,
     alignItems: 'center',
@@ -1080,13 +1458,45 @@ const styles = StyleSheet.create({
   submitButtonDisabled: {
     backgroundColor: '#ccc',
   },
+  submitButtonUploading: {
+    backgroundColor: SPOTZ_BRAND.accent,
+    opacity: 0.86,
+  },
+  submitButtonContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+  },
   submitButtonText: {
     color: '#ffffff',
     fontSize: 16,
     fontWeight: '600',
   },
-  bottomPadding: {
-    height: 100,
+  submitButtonTextSpotz: {
+    color: SPOTZ_THEME.accentText,
+  },
+  uploadProgressContainer: {
+    marginTop: 10,
+    paddingHorizontal: 2,
+  },
+  uploadProgressTrack: {
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: 'rgba(139, 158, 139, 0.16)',
+    overflow: 'hidden',
+  },
+  uploadProgressFill: {
+    height: '100%',
+    borderRadius: 2,
+    backgroundColor: SPOTZ_BRAND.accent,
+  },
+  uploadProgressText: {
+    color: '#666666',
+    fontSize: 12,
+    fontWeight: '600',
+    marginTop: 7,
+    textAlign: 'center',
   },
   // Image Picker Styles
   imagePickerButton: {
@@ -1141,21 +1551,46 @@ const styles = StyleSheet.create({
     width: 28,
     height: 28,
     borderRadius: 14,
-    backgroundColor: 'rgba(255, 255, 255, 0.2)',
     justifyContent: 'center',
     alignItems: 'center',
     borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.3)',
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.3,
     shadowRadius: 4,
     elevation: 4,
   },
+  removeImageButtonDark: {
+    backgroundColor: 'rgba(8, 12, 18, 0.72)',
+    borderColor: 'rgba(255, 255, 255, 0.24)',
+  },
+  removeImageButtonLight: {
+    backgroundColor: 'rgba(255, 255, 255, 0.78)',
+    borderColor: 'rgba(15, 23, 42, 0.16)',
+    shadowOpacity: 0.18,
+  },
+  removeImageButtonAndroidDark: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: 'rgba(8, 12, 18, 0.78)',
+    borderColor: 'rgba(255, 255, 255, 0.22)',
+    elevation: 3,
+  },
+  removeImageButtonAndroidLight: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: 'rgba(255, 255, 255, 0.84)',
+    borderColor: 'rgba(15, 23, 42, 0.18)',
+    elevation: 3,
+  },
+  removeImageIcon: {
+    lineHeight: 20,
+    textAlign: 'center',
+  },
   removeImageText: {
-    color: '#ffffff',
-    fontSize: 14,
-    fontWeight: 'bold',
+    display: 'none',
   },
 });
 

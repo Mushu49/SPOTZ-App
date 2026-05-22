@@ -1,0 +1,366 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function isAdmin() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    function protectedUserFields() {
+      return [
+        'isBanned',
+        'banReason',
+        'bannedAt',
+        'bannedBy',
+        'role',
+        'isAdmin',
+        'isFounder',
+        'founderNumber',
+        'founderGrantedAt',
+        'proUntil',
+        'proSource'
+      ];
+    }
+
+    function hasNoProtectedUserFieldsOnCreate() {
+      return !request.resource.data.keys().hasAny([
+        'banReason',
+        'bannedAt',
+        'bannedBy',
+        'role',
+        'isAdmin'
+      ])
+      && (
+        !request.resource.data.keys().hasAny(['isBanned'])
+        || request.resource.data.isBanned == false
+      )
+      && hasValidFounderFieldsOnCreate();
+    }
+
+    function hasNoProtectedUserFieldsOnUpdate() {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(protectedUserFields());
+    }
+
+    function hasOnlyAdminUserModerationFields() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+        'isBanned',
+        'banReason',
+        'bannedAt',
+        'bannedBy',
+        'updatedAt'
+      ]);
+    }
+
+    function hasOnlyReportReviewFields() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+        'status',
+        'reviewedAt',
+        'reviewedBy',
+        'reviewNote',
+        'actionTaken'
+      ]);
+    }
+
+    function hasValidReportStatus() {
+      return request.resource.data.status in [
+        'open',
+        'reviewed',
+        'action_taken',
+        'dismissed'
+      ];
+    }
+
+    function hasOnlySpotModerationFields() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+        'isRemoved',
+        'removedReason',
+        'removedAt',
+        'removedBy',
+        'updatedAt'
+      ]);
+    }
+
+    function hasNoSpotModerationFieldsOnCreate() {
+      return !request.resource.data.keys().hasAny([
+        'removedReason',
+        'removedAt',
+        'removedBy'
+      ])
+      && (
+        !request.resource.data.keys().hasAny(['isRemoved'])
+        || request.resource.data.isRemoved == false
+      );
+    }
+
+    function hasNoSpotModerationFieldsOnUpdate() {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+        'isRemoved',
+        'removedReason',
+        'removedAt',
+        'removedBy'
+      ]);
+    }
+
+    function currentUserIsBanned() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.keys().hasAny(['isBanned'])
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isBanned == true;
+    }
+
+    function currentUserIsNotBanned() {
+      return signedIn() && !currentUserIsBanned();
+    }
+
+    function founderProgramCounterWasCreatedForSignup() {
+      return !exists(/databases/$(database)/documents/appConfig/founderProgram)
+        && existsAfter(/databases/$(database)/documents/appConfig/founderProgram)
+        && getAfter(/databases/$(database)/documents/appConfig/founderProgram).data.keys().hasOnly([
+          'maxFounders',
+          'claimedCount'
+        ])
+        && getAfter(/databases/$(database)/documents/appConfig/founderProgram).data.maxFounders == 500
+        && getAfter(/databases/$(database)/documents/appConfig/founderProgram).data.claimedCount == 1;
+    }
+
+    function founderProgramCounterAdvancedForSignup() {
+      return exists(/databases/$(database)/documents/appConfig/founderProgram)
+        && existsAfter(/databases/$(database)/documents/appConfig/founderProgram)
+        && getAfter(/databases/$(database)/documents/appConfig/founderProgram).data.keys().hasOnly([
+          'maxFounders',
+          'claimedCount'
+        ])
+        && getAfter(/databases/$(database)/documents/appConfig/founderProgram).data.maxFounders == get(/databases/$(database)/documents/appConfig/founderProgram).data.maxFounders
+        && getAfter(/databases/$(database)/documents/appConfig/founderProgram).data.claimedCount == get(/databases/$(database)/documents/appConfig/founderProgram).data.claimedCount + 1
+        && getAfter(/databases/$(database)/documents/appConfig/founderProgram).data.claimedCount <= getAfter(/databases/$(database)/documents/appConfig/founderProgram).data.maxFounders;
+    }
+
+    function founderProgramCounterClaimsOneSlot() {
+      return founderProgramCounterWasCreatedForSignup()
+        || founderProgramCounterAdvancedForSignup();
+    }
+
+    function hasFounderGrantOnCreate() {
+      return request.resource.data.isFounder == true
+        && request.resource.data.founderNumber is int
+        && request.resource.data.founderNumber > 0
+        && request.resource.data.founderGrantedAt is timestamp
+        && request.resource.data.proUntil is timestamp
+        && request.resource.data.proSource == 'founder'
+        && founderProgramCounterClaimsOneSlot()
+        && request.resource.data.founderNumber == getAfter(/databases/$(database)/documents/appConfig/founderProgram).data.claimedCount
+        && request.resource.data.founderNumber <= getAfter(/databases/$(database)/documents/appConfig/founderProgram).data.maxFounders;
+    }
+
+    function hasNoFounderGrantOnCreate() {
+      return request.resource.data.isFounder == false
+        && request.resource.data.founderNumber == null
+        && request.resource.data.founderGrantedAt == null
+        && request.resource.data.proUntil == null
+        && request.resource.data.proSource == null;
+    }
+
+    function hasValidFounderFieldsOnCreate() {
+      return (
+        request.resource.data.keys().hasAll([
+          'isFounder',
+          'founderNumber',
+          'founderGrantedAt',
+          'proUntil',
+          'proSource'
+        ])
+        && (
+          hasFounderGrantOnCreate()
+          || hasNoFounderGrantOnCreate()
+        )
+      );
+    }
+
+    function founderProgramMatchesNewFounderUser() {
+      return existsAfter(/databases/$(database)/documents/users/$(request.auth.uid))
+        && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.isFounder == true
+        && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.founderNumber == request.resource.data.claimedCount
+        && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.proSource == 'founder';
+    }
+
+    function spotIsVisible(spotId) {
+      return exists(/databases/$(database)/documents/spots/$(spotId))
+        && get(/databases/$(database)/documents/spots/$(spotId)).data.isRemoved == false;
+    }
+
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      allow create: if isOwner(uid) && hasNoProtectedUserFieldsOnCreate();
+      allow update: if (
+        isOwner(uid) && hasNoProtectedUserFieldsOnUpdate()
+      ) || (
+        isAdmin() && hasOnlyAdminUserModerationFields()
+      );
+      allow delete: if false;
+
+      match /favorites/{spotId} {
+        allow read: if isOwner(uid) || isAdmin();
+        allow create, update, delete: if isOwner(uid) && currentUserIsNotBanned();
+      }
+
+      match /pushTokens/{tokenId} {
+        allow read, create, update, delete: if isOwner(uid) && currentUserIsNotBanned();
+      }
+    }
+
+    match /appConfig/{configId} {
+      allow read: if isAdmin()
+        || (
+          configId == 'founderProgram'
+          && currentUserIsNotBanned()
+        );
+      allow create, update: if configId == 'founderProgram'
+        && currentUserIsNotBanned()
+        && request.resource.data.keys().hasOnly([
+          'maxFounders',
+          'claimedCount'
+        ])
+        && founderProgramCounterClaimsOneSlot()
+        && founderProgramMatchesNewFounderUser();
+      allow delete: if false;
+    }
+
+    match /notifications/{notificationId} {
+      allow read: if isAdmin()
+        || (
+          currentUserIsNotBanned()
+          && resource.data.recipientId == request.auth.uid
+        );
+      allow create: if currentUserIsNotBanned()
+        && request.resource.data.actorId == request.auth.uid
+        && request.resource.data.recipientId is string
+        && request.resource.data.recipientId != request.auth.uid
+        && request.resource.data.type in [
+          'spot_comment',
+          'comment_reply',
+          'spot_favorite'
+        ];
+      allow update: if currentUserIsNotBanned()
+        && resource.data.recipientId == request.auth.uid
+        && request.resource.data.recipientId == resource.data.recipientId
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'isRead',
+          'readAt',
+          'hidden',
+          'clearedAt',
+          'updatedAt'
+        ])
+        && (
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['hidden'])
+          || request.resource.data.hidden == true
+        );
+      allow delete: if currentUserIsNotBanned()
+        && resource.data.recipientId == request.auth.uid;
+    }
+
+    match /publicProfiles/{uid} {
+      allow read: if currentUserIsNotBanned();
+      allow create: if isOwner(uid)
+        && currentUserIsNotBanned()
+        && request.resource.data.keys().hasOnly([
+          'id',
+          'userId',
+          'username',
+          'usernameLower',
+          'normalizedUsername',
+          'displayName',
+          'bio',
+          'profileImageUrl',
+          'avatarUrl',
+          'showProfileImageInComments',
+          'createdAt',
+          'updatedAt'
+        ]);
+      allow update: if isOwner(uid)
+        && currentUserIsNotBanned()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'id',
+          'userId',
+          'username',
+          'usernameLower',
+          'normalizedUsername',
+          'displayName',
+          'bio',
+          'profileImageUrl',
+          'avatarUrl',
+          'showProfileImageInComments',
+          'createdAt',
+          'updatedAt'
+        ]);
+      allow delete: if isOwner(uid) && currentUserIsNotBanned();
+    }
+
+    match /usernames/{username} {
+      allow read: if true;
+      allow create, update: if true;
+      allow delete: if false;
+    }
+
+    match /spots/{spotId} {
+      allow read: if isAdmin()
+        || (
+          currentUserIsNotBanned()
+          && resource.data.isRemoved == false
+        );
+      allow create: if currentUserIsNotBanned()
+        && request.resource.data.creatorId == request.auth.uid
+        && request.resource.data.createdBy == request.auth.uid
+        && hasNoSpotModerationFieldsOnCreate();
+      allow update: if (
+        currentUserIsNotBanned()
+        && hasNoSpotModerationFieldsOnUpdate()
+      ) || (
+        isAdmin()
+        && hasOnlySpotModerationFields()
+      );
+      allow delete: if currentUserIsNotBanned()
+        && resource.data.createdBy == request.auth.uid;
+
+      match /comments/{commentId} {
+        allow read: if isAdmin() || (currentUserIsNotBanned() && spotIsVisible(spotId));
+        allow create: if currentUserIsNotBanned()
+          && spotIsVisible(spotId)
+          && request.resource.data.userId == request.auth.uid;
+        allow update: if currentUserIsNotBanned() && spotIsVisible(spotId);
+        allow delete: if currentUserIsNotBanned()
+          && spotIsVisible(spotId)
+          && resource.data.userId == request.auth.uid;
+      }
+
+      match /likes/{likeId} {
+        allow read: if isAdmin() || (currentUserIsNotBanned() && spotIsVisible(spotId));
+        allow create, update, delete: if currentUserIsNotBanned() && spotIsVisible(spotId);
+      }
+    }
+
+    match /reports/{reportId} {
+      allow create: if signedIn()
+        && request.resource.data.reporterId == request.auth.uid
+        && request.resource.data.status == 'open';
+      allow read: if isAdmin();
+      allow update: if isAdmin()
+        && hasOnlyReportReviewFields()
+        && hasValidReportStatus();
+      allow delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
